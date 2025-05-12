@@ -5,12 +5,12 @@
 #![allow(clippy::manual_let_else)]
 
 pub(crate) mod error;
-pub mod kv;
+pub(crate) mod executor;
+pub mod input;
 pub mod log;
 pub mod protocol;
 pub(crate) mod rpc;
 pub(crate) mod runtime;
-pub(crate) mod waitgroup;
 
 pub use error::*;
 pub use rpc::*;

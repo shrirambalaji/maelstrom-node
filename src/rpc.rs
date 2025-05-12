@@ -62,7 +62,7 @@ impl RPCResult {
     /// ```
     pub fn done(&mut self) {
         drop(self.rx.take());
-        drop(self.runtime.release_rpc_sender(self.msg_id));
+        drop(self.runtime.remove_sender(self.msg_id));
     }
 
     /// Acquires a RPC call response within specific timeout.
@@ -95,10 +95,10 @@ impl RPCResult {
                 Ok(resp) => result = rpc_msg_type(resp),
                 Err(err) => result = Err(Box::new(err)),
             },
-            _ = ctx.done() => result = Err(Box::new(Error::Timeout)),
+            () = ctx.done() => result = Err(Box::new(Error::Timeout)),
         }
 
-        drop(self.runtime.release_rpc_sender(self.msg_id));
+        drop(self.runtime.remove_sender(self.msg_id));
 
         result
     }
@@ -151,16 +151,12 @@ impl Future for RPCResult {
 
 pub(crate) async fn rpc(runtime: Runtime, msg_id: u64, req: Result<String>) -> Result<RPCResult> {
     let req_str = req?;
-
     let (tx, rx) = oneshot::channel::<Message>();
-
-    let _ = runtime.insert_rpc_sender(msg_id, tx).await;
-
+    let _ = runtime.insert_sender(msg_id, tx).await;
     if let Err(err) = runtime.send_raw(req_str.as_str()).await {
-        let _ = runtime.release_rpc_sender(msg_id).await;
+        let _ = runtime.remove_sender(msg_id).await;
         return Err(err);
     }
-
     Ok(RPCResult::new(msg_id, rx, runtime))
 }
 

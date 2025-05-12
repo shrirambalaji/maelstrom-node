@@ -27,7 +27,7 @@ pub struct MessageBody {
     #[serde(default, skip_serializing_if = "u64_zero_by_ref")]
     pub msg_id: u64,
 
-    /// Optional. For request/response, the msg_id of the request.
+    /// Optional. For request/response, the `msg_id` of the request.
     #[serde(default, skip_serializing_if = "u64_zero_by_ref")]
     pub in_reply_to: u64,
 
@@ -65,9 +65,16 @@ pub struct ErrorMessageBody {
 }
 
 impl Message {
-    #[must_use]
     pub fn get_type(&self) -> &str {
-        return self.body.typ.as_str();
+        self.body.typ.as_str()
+    }
+
+    pub fn is_init(&self) -> bool {
+        self.body.typ == "init"
+    }
+
+    pub fn is_reply(&self) -> bool {
+        self.body.in_reply_to != 0
     }
 }
 
@@ -172,7 +179,7 @@ impl ErrorMessageBody {
 
 impl From<Error> for ErrorMessageBody {
     fn from(value: Error) -> Self {
-        return ErrorMessageBody {
+        ErrorMessageBody {
             typ: "error".to_string(),
             code: value.code(),
             text: match value {
@@ -180,7 +187,7 @@ impl From<Error> for ErrorMessageBody {
                 Error::Custom(id, t) => format!("error({id}): {t}"),
                 o => o.description().to_string(),
             },
-        };
+        }
     }
 }
 
@@ -220,7 +227,7 @@ mod test {
     fn parse_message() -> Result<()> {
         let echo = r#"{ "src": "c1", "dest": "n1", "body": { "type": "echo", "msg_id": 1, "echo": "Please echo 35" }}"#;
 
-        let msg = serde_json::from_str::<Message>(&echo)?;
+        let msg = serde_json::from_str::<Message>(echo)?;
         let expected = Message {
             src: "c1".to_string(),
             dest: "n1".to_string(),
@@ -238,7 +245,7 @@ mod test {
     #[test]
     fn parse_init_message() -> Result<()> {
         let init = r#"{"type":"init","msg_id":1,"node_id":"n0","node_ids":["n0","n1"]}"#;
-        let msg: InitMessageBody = serde_json::from_str(&init)?;
+        let msg: InitMessageBody = serde_json::from_str(init)?;
         let expect = InitMessageBody::example("n0", &["n0", "n1"]);
         assert_eq!(msg, expect);
         Ok(())
@@ -246,10 +253,10 @@ mod test {
 
     impl InitMessageBody {
         fn example(n: &str, s: &[&str]) -> Self {
-            return InitMessageBody {
+            InitMessageBody {
                 node_id: n.to_string(),
-                nodes: s.iter().map(|x| x.to_string()).collect(),
-            };
+                nodes: s.iter().map(|x| (*x).to_string()).collect(),
+            }
         }
     }
 }

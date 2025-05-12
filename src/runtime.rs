@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use crate::error::Error;
+use crate::executor::{Executor, RuntimeExecutor};
 use crate::protocol::{ErrorMessageBody, InitMessageBody, Message};
-use crate::waitgroup::WaitGroup;
 use crate::{rpc_err_to_response, RPCResult};
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -15,104 +15,28 @@ use std::future::Future;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{AcqRel, Release};
 use std::sync::Arc;
-use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, Stdout};
+use tokio::io::{stdin, stdout, AsyncBufReadExt, AsyncWriteExt, BufReader, Stdout};
 use tokio::select;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::{mpsc, Mutex, OnceCell};
-use tokio::task::JoinHandle;
-use tokio_context::context::Context;
-
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 pub struct Runtime {
-    // we need an arc<> here to be able to pass runtime.clone() from &Self run() further
-    // to the handler.
-    inter: Arc<Inter>,
+    context: Arc<Context>,
+    executor: RuntimeExecutor,
 }
 
-struct Inter {
+struct Context {
     msg_id: AtomicU64,
-
-    // OnceCell seems works better here than RwLock, but what do we think of cluster membership change?
-    // How the API should behave if the Maelstrom will send the second init message?
-    // Let's pick the approach when it is possible to only once initialize a node and a cluster
-    // membership change must start a new node and stop the old ones.
     membership: OnceCell<MembershipState>,
-
-    handler: OnceCell<Arc<dyn Node>>,
-
-    rpc: Mutex<HashMap<u64, Sender<Message>>>,
-
-    out: Mutex<Stdout>,
-
-    serving: WaitGroup,
+    node: OnceCell<Arc<dyn Node>>,
+    pending_replies: Mutex<HashMap<u64, Sender<Message>>>,
+    stdout: Mutex<Stdout>,
 }
 
-// Handler is the trait that implements message handling.
 #[async_trait]
 pub trait Node: Sync + Send {
-    /// Main handler function that processes incoming requests.
-    ///
-    /// Example:
-    ///
-    /// ```
-    /// use async_trait::async_trait;
-    /// use maelstrom::protocol::Message;
-    /// use maelstrom::{Node, Result, Runtime, done};
-    ///
-    /// struct Handler {}
-    ///
-    /// #[async_trait]
-    /// impl Node for Handler {
-    ///     async fn process(&self, runtime: Runtime, req: Message) -> Result<()> {
-    ///         if req.get_type() == "echo" {
-    ///             let echo = req.body.clone().with_type("echo_ok");
-    ///             return runtime.reply(req, echo).await;
-    ///         }
-    ///
-    ///         // all other types are unsupported
-    ///         done(runtime, req)
-    ///     }
-    /// }
-    /// ```
     async fn process(&self, runtime: Runtime, request: Message) -> Result<()>;
-}
-
-/// Returns a result with `NotSupported` error meaning that Node.process()
-/// is not aware of specific message type or Ok(()) for init.
-///
-/// Example:
-///
-/// ```
-/// use async_trait::async_trait;
-/// use maelstrom::{Node, Runtime, Result, done};
-/// use maelstrom::protocol::Message;
-///
-/// struct Handler {}
-///
-/// #[async_trait]
-/// impl Node for Handler {
-///     async fn process(&self, runtime: Runtime, req: Message) -> Result<()> {
-///         // would skip init and respond with Code == 10 for any other type.
-///         done(runtime, req)
-///     }
-/// }
-/// ```
-#[allow(clippy::needless_pass_by_value)]
-pub fn done(runtime: Runtime, message: Message) -> Result<()> {
-    if message.get_type() == "init" {
-        return Ok(());
-    }
-
-    let err = Error::NotSupported(message.body.typ.clone());
-    let msg: ErrorMessageBody = err.clone().into();
-
-    let runtime0 = runtime.clone();
-    runtime.spawn(async move {
-        let _ = runtime0.reply(message, msg).await;
-    });
-
-    Err(Box::new(err))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
@@ -123,76 +47,42 @@ pub struct MembershipState {
 
 impl Runtime {
     pub fn init<F: Future>(future: F) -> F::Output {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let _guard = runtime.enter();
-
-        crate::log::builder().init();
-        debug!("inited");
-
-        runtime.block_on(future)
+        let tokio_runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard: tokio::runtime::EnterGuard<'_> = tokio_runtime.enter();
+        tokio_runtime.block_on(future)
     }
 }
 
 impl Runtime {
-    #[must_use]
     pub fn new() -> Self {
         Runtime::default()
     }
 
-    #[must_use]
-    pub fn with_handler(self, handler: Arc<dyn Node + Send + Sync>) -> Self {
+    pub fn with_node(self, node: Arc<dyn Node + Send + Sync>) -> Self {
         assert!(
-            self.inter.handler.set(handler).is_ok(),
-            "runtime handler is already initialized"
+            self.context.node.set(node).is_ok(),
+            "runtime node is already initialized"
         );
         self
     }
 
     pub async fn send_raw(&self, msg: &str) -> Result<()> {
         {
-            let mut out = self.inter.out.lock().await;
+            let mut out = self.context.stdout.lock().await;
             out.write_all(msg.as_bytes()).await?;
             out.write_all(b"\n").await?;
         }
-        info!("Sent {}", msg);
+        info!("Sent {msg}");
         Ok(())
     }
 
-    pub fn send_async<T>(&self, to: impl Into<String>, message: T) -> Result<()>
-    where
-        T: Serialize + Send,
-    {
-        let runtime = self.clone();
-        let msg = crate::protocol::message(self.node_id(), to, message)?;
-        let ans = serde_json::to_string(&msg)?;
-        self.spawn(async move {
-            if let Err(err) = runtime.send_raw(ans.as_str()).await {
-                error!("send error: {}", err);
-            }
-        });
-        Ok(())
-    }
-
-    pub async fn send<T>(&self, to: impl Into<String>, message: T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    pub async fn send(&self, to: impl Into<String>, message: impl Serialize) -> Result<()> {
         let msg = crate::protocol::message(self.node_id(), to, message)?;
         let ans = serde_json::to_string(&msg)?;
         self.send_raw(ans.as_str()).await
     }
 
-    pub async fn send_back<T>(&self, req: Message, resp: T) -> Result<()>
-    where
-        T: Serialize,
-    {
-        self.send(req.src, resp).await
-    }
-
-    pub async fn reply<T>(&self, req: Message, resp: T) -> Result<()>
-    where
-        T: Serialize,
-    {
+    pub async fn reply(&self, req: Message, resp: impl Serialize) -> Result<()> {
         let mut msg = crate::protocol::message(self.node_id(), req.src, resp)?;
         msg.body.in_reply_to = req.body.msg_id;
 
@@ -210,76 +100,14 @@ impl Runtime {
         self.reply(req, Runtime::empty_response()).await
     }
 
-    #[track_caller]
-    pub fn spawn<T>(&self, future: T) -> JoinHandle<T::Output>
-    where
-        T: Future + Send + 'static,
-        T::Output: Send + 'static,
-    {
-        let h = self.inter.serving.clone();
-        tokio::spawn(future.then(|x| async move {
-            drop(h);
-            x
-        }))
-    }
-
-    /// rpc() makes a remote call to another node via message passing interface.
-    /// Provided context may serve as a timeout limiter.
+    /// `rpc()` makes a remote call to another node via message passing interface.
     /// `RPCResult` is immediately canceled on drop.
-    ///
-    /// Example:
-    /// ```
-    /// use maelstrom::{Error, Result, Runtime};
-    /// use std::fmt::{Display, Formatter};
-    /// use serde::Serialize;
-    /// use serde::Deserialize;
-    /// use tokio_context::context::Context;
-    ///
-    /// pub struct Storage {
-    ///     typ: &'static str,
-    ///     runtime: Runtime,
-    /// }
-    ///
-    /// impl Storage {
-    ///     async fn get<T>(&self, ctx: Context, key: String) -> Result<T>
-    ///         where
-    ///             T: Deserialize<'static> + Send,
-    ///     {
-    ///         let req = Message::Read::<String> { key };
-    ///         let mut call = self.runtime.rpc(self.typ, req).await?;
-    ///         let msg = call.done_with(ctx).await?;
-    ///         let data = msg.body.as_obj::<Message<T>>()?;
-    ///         match data {
-    ///             Message::ReadOk { value } => Ok(value),
-    ///             _ => Err(Box::new(Error::Custom(
-    ///                 -1,
-    ///                 "kv: protocol violated".to_string(),
-    ///             ))),
-    ///         }
-    ///     }
-    /// }
-    ///
-    /// #[derive(Serialize, Deserialize)]
-    /// #[serde(rename_all = "snake_case", tag = "type")]
-    /// enum Message<T> {
-    ///     Read {
-    ///         key: String,
-    ///     },
-    ///     ReadOk {
-    ///         value: T,
-    ///     },
-    /// }
-    /// ```
-    pub fn rpc<T>(
+    pub fn rpc(
         &self,
         to: impl Into<String>,
-        request: T,
-    ) -> impl Future<Output = Result<RPCResult>>
-    where
-        T: Serialize,
-    {
+        request: impl Serialize,
+    ) -> impl Future<Output = Result<RPCResult>> {
         let msg = crate::protocol::message(self.node_id(), to, request);
-
         let req_msg_id = self.next_msg_id();
         let req_res: Result<String> = match msg {
             Ok(mut t) => {
@@ -295,94 +123,58 @@ impl Runtime {
         crate::rpc(self.clone(), req_msg_id, req_res)
     }
 
-    /// call() is the same as `let _: Result<Message> = rpc().await?.done_with(ctx).await;`.
-    /// for examples see [`Runtime::rpc`] and [`RPCResult`].
-    ///
-    /// rpc() makes a remote call to another node via message passing interface.
-    /// Provided context may serve as a timeout limiter.
-    /// `RPCResult` is immediately canceled on drop.
-    pub async fn call<T>(&self, ctx: Context, to: impl Into<String>, request: T) -> Result<Message>
-    where
-        T: Serialize,
-    {
-        let mut call = self.rpc(to, request).await?;
-        call.done_with(ctx).await
+    pub fn execute_rpc(&self, to: impl Into<String>, request: impl Serialize + 'static) {
+        self.executor.spawn(self.rpc(to.into(), request));
     }
 
-    /// `call_async`() is equivalent to `runtime.spawn(runtime.call(...))`.
-    /// see [`Runtime::call`], [`Runtime::rpc`].
-    pub fn call_async<T>(&self, to: impl Into<String>, request: T)
-    where
-        T: Serialize + 'static,
-    {
-        self.spawn(self.rpc(to.into(), request));
-    }
-
-    #[must_use]
     pub fn node_id(&self) -> &str {
-        if let Some(v) = self.inter.membership.get() {
+        if let Some(v) = self.context.membership.get() {
             return v.node_id.as_str();
         }
         ""
     }
 
-    #[must_use]
     pub fn nodes(&self) -> &[String] {
-        if let Some(v) = self.inter.membership.get() {
+        if let Some(v) = self.context.membership.get() {
             return v.nodes.as_slice();
         }
         &[]
     }
 
     pub fn set_membership_state(&self, state: MembershipState) -> Result<()> {
-        debug!("new {:?}", state);
-
-        if let Err(e) = self.inter.membership.set(state) {
+        if let Err(e) = self.context.membership.set(state) {
             bail!("membership is inited: {}", e);
         }
-
-        // new node = new message sequence
-        self.inter.msg_id.store(1, Release);
-
+        self.context.msg_id.store(1, Release);
         Ok(())
     }
 
     pub async fn done(&self) {
-        self.inter.serving.wait().await;
+        self.executor.done().await;
     }
 
     pub async fn run(&self) -> Result<()> {
-        self.run_with(BufReader::new(stdin())).await
-    }
-
-    pub async fn run_with<R>(&self, input: BufReader<R>) -> Result<()>
-    where
-        R: AsyncRead + Unpin,
-    {
-        let stdin = input;
-
         let (tx_err, mut rx_err) = mpsc::channel::<Result<()>>(1);
         let mut tx_out: Result<()> = Ok(());
-
-        let mut lines_from_stdin = stdin.lines();
+        let mut lines = BufReader::new(stdin()).lines();
         loop {
             select! {
-                Ok(read) = lines_from_stdin.next_line().fuse() => {
+                Ok(read) = lines.next_line().fuse() => {
                     match read {
                         Some(line) =>{
                             if line.trim().is_empty() {
                                 continue;
                             }
 
-                            info!("Received {}", line);
+                            info!("Received {line}");
 
                             let tx_err0 = tx_err.clone();
-                            self.spawn(Self::process_request(self.clone(), line).then(|result| async move  {
+                            self.executor.spawn(Self::process_input(self.clone(), line).then(|result| async move  {
                                 if let Err(e) = result {
                                     if let Some(Error::NotSupported(t)) = e.downcast_ref::<Error>() {
-                                        warn!("message type not supported: {}", t);
+                                        warn!("message type not supported: {t}");
                                     } else {
-                                        error!("process_request error: {}", e);
+                                        error!("process_request error: {e}");
                                         let _ = tx_err0.send(Err(e)).await;
                                     }
                                 }
@@ -397,7 +189,7 @@ impl Runtime {
         }
 
         select! {
-            _ = self.done() => {},
+            () = self.done() => {},
             Some(e) = rx_err.recv() => tx_out = e,
         }
 
@@ -410,43 +202,37 @@ impl Runtime {
         rx_err.close();
 
         if let Err(e) = tx_out {
-            debug!("node error: {}", e);
+            debug!("node error: {e}");
             return Err(e);
         }
-
-        // TODO: print stats?
-        debug!("node done");
 
         Ok(())
     }
 
-    async fn process_request(runtime: Runtime, line: String) -> Result<()> {
+    // TODO: move to this to input modeule
+    async fn process_input(runtime: Runtime, line: String) -> Result<()> {
         let msg = match serde_json::from_str::<Message>(line.as_str()) {
             Ok(v) => v,
             Err(err) => return Err(Box::new(err)),
         };
 
-        // rpc call
-        if msg.body.in_reply_to > 0 {
-            let mut guard = runtime.inter.rpc.lock().await;
-            if let Some(tx) = guard.remove(&msg.body.in_reply_to) {
-                // we don't need to hold mutex for doing long blocking tx.send.
-                drop(guard);
-                // at the moment we don't care of the send err because I expect
-                // it will fail only if the rx end is closed.
-                drop(tx.send(msg));
+        if msg.is_reply() {
+            let mut replies = runtime.context.pending_replies.lock().await;
+            let tx = replies.remove(&msg.body.in_reply_to);
+            if let Some(tx) = tx {
+                tx.send(msg);
             }
             return Ok(());
         }
 
         let mut init_source: Option<(String, u64)> = None;
-        let is_init = msg.get_type() == "init";
-        if is_init {
+        let is_init = msg.is_init();
+        if msg.is_init() {
             init_source = Some((msg.src.clone(), msg.body.msg_id));
             runtime.process_init(&msg)?;
         }
 
-        if let Some(handler) = runtime.inter.handler.get() {
+        if let Some(handler) = runtime.context.node.get() {
             // I am not happy we are cloning a msg here, but let it go this time.
             let res = handler.process(runtime.clone(), msg.clone()).await;
             if res.is_err() {
@@ -479,47 +265,27 @@ impl Runtime {
         })
     }
 
-    #[inline]
-    #[must_use]
     pub fn next_msg_id(&self) -> u64 {
-        self.inter.msg_id.fetch_add(1, AcqRel)
+        self.context.msg_id.fetch_add(1, AcqRel)
     }
 
-    #[inline]
-    #[must_use]
     pub fn empty_response() -> Value {
         Value::Object(serde_json::Map::default())
     }
 
-    #[inline]
-    pub(crate) async fn insert_rpc_sender(
+    pub(crate) async fn insert_sender(
         &self,
         id: u64,
         tx: Sender<Message>,
     ) -> Option<Sender<Message>> {
-        self.inter.rpc.lock().await.insert(id, tx)
+        self.context.pending_replies.lock().await.insert(id, tx)
     }
 
-    #[inline]
-    pub(crate) async fn release_rpc_sender(&self, id: u64) -> Option<Sender<Message>> {
-        self.inter.rpc.lock().await.remove(&id)
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn is_client(&self, src: &String) -> bool {
-        !src.is_empty() && src.starts_with('c')
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn is_from_cluster(&self, src: &String) -> bool {
-        // alternative implementation: self.nodes().contains(src)
-        !src.is_empty() && src.starts_with('n')
+    pub(crate) async fn remove_sender(&self, id: u64) -> Option<Sender<Message>> {
+        self.context.pending_replies.lock().await.remove(&id)
     }
 
     /// All nodes that are not this node.
-    #[inline]
     pub fn neighbours(&self) -> impl Iterator<Item = &String> {
         let n = self.node_id();
         self.nodes()
@@ -531,14 +297,14 @@ impl Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Runtime {
-            inter: Arc::new(Inter {
+            context: Arc::new(Context {
                 msg_id: AtomicU64::new(1),
                 membership: OnceCell::new(),
-                handler: OnceCell::new(),
-                rpc: Mutex::default(),
-                out: Mutex::new(stdout()),
-                serving: WaitGroup::new(),
+                node: OnceCell::new(),
+                pending_replies: Mutex::default(),
+                stdout: Mutex::new(stdout()),
             }),
+            executor: RuntimeExecutor::default(),
         }
     }
 }
@@ -546,61 +312,62 @@ impl Default for Runtime {
 impl Clone for Runtime {
     fn clone(&self) -> Self {
         Runtime {
-            inter: self.inter.clone(),
+            context: self.context.clone(),
+            executor: self.executor.clone(),
         }
     }
 }
 
-#[derive(Default, Copy, Clone, PartialEq, Eq, Debug)]
-pub struct BlackHoleNode {}
-
-#[async_trait]
-impl Node for BlackHoleNode {
-    async fn process(&self, _: Runtime, _: Message) -> Result<()> {
-        Ok(())
+/// Returns a result with `NotSupported` error meaning that `Node.process()`
+/// is not aware of specific message type or Ok(()) for init.
+#[allow(clippy::needless_pass_by_value)]
+pub fn done(runtime: Runtime, message: Message) -> Result<()> {
+    if message.is_init() {
+        return Ok(());
     }
-}
 
-// TODO: make err customizable
-#[derive(Default, Copy, Clone, PartialEq, Eq, Debug)]
-pub struct IOFailingNode {}
+    let err = Error::NotSupported(message.body.typ.clone());
+    let msg: ErrorMessageBody = err.clone().into();
 
-#[async_trait]
-impl Node for IOFailingNode {
-    async fn process(&self, _: Runtime, _: Message) -> Result<()> {
-        bail!("IOFailingNode: process failed")
-    }
-}
+    let runtime0 = runtime.clone();
+    runtime.executor.spawn(async move {
+        let _ = runtime0.reply(message, msg).await;
+    });
 
-#[derive(Default, Copy, Clone, PartialEq, Eq, Debug)]
-pub struct EchoNode {}
-
-#[async_trait]
-impl Node for EchoNode {
-    async fn process(&self, runtime: Runtime, req: Message) -> Result<()> {
-        let resp = Value::Object(serde_json::Map::default());
-        runtime.reply(req, resp).await
-    }
+    Err(Box::new(err))
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{MembershipState, Result, Runtime};
-    use tokio::io::BufReader;
-    use tokio_util::sync::CancellationToken;
+    use crate::{executor::Executor, protocol::Message, MembershipState, Result, Runtime};
+    use async_trait::async_trait;
+    use simple_error::bail;
+
+    use super::Node;
+
+    #[derive(Default, Copy, Clone, PartialEq, Eq, Debug)]
+    pub struct IOFailingNode {}
+
+    #[async_trait]
+    impl Node for IOFailingNode {
+        async fn process(&self, _: Runtime, _: Message) -> Result<()> {
+            bail!("IOFailingNode: process failed")
+        }
+    }
 
     #[test]
     fn membership() -> Result<()> {
         let tokio_runtime = tokio::runtime::Runtime::new()?;
+
         tokio_runtime.block_on(async move {
             let runtime = Runtime::new();
             let runtime0 = runtime.clone();
             let s1 = MembershipState::example("n0", &["n0", "n1"]);
             let s2 = MembershipState::example("n1", &["n0", "n1"]);
-            runtime.spawn(async move {
+            runtime.executor.spawn(async move {
                 runtime0.set_membership_state(s1).unwrap();
                 async move {
-                    assert!(matches!(runtime0.set_membership_state(s2), Err(_)));
+                    assert!(runtime0.set_membership_state(s2).is_err());
                 }
                 .await;
             });
@@ -616,26 +383,10 @@ mod test {
 
     impl MembershipState {
         fn example(n: &str, s: &[&str]) -> Self {
-            return MembershipState {
+            MembershipState {
                 node_id: n.to_string(),
-                nodes: s.iter().map(|x| x.to_string()).collect(),
-            };
+                nodes: s.iter().map(|x| (*x).to_string()).collect(),
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn io_failure() {
-        let handler = std::sync::Arc::new(crate::IOFailingNode::default());
-        let runtime = Runtime::new().with_handler(handler);
-        let cursor = std::io::Cursor::new(
-            r#"
-            
-            {"src":"c0","dest":"n0","body":{"type":"echo","msg_id":1}}
-            "#,
-        );
-        let token = CancellationToken::new();
-        runtime.spawn(async move { token.cancelled().await });
-        let run = runtime.run_with(BufReader::new(cursor));
-        assert!(matches!(run.await, Err(_)));
     }
 }

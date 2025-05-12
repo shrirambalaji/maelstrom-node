@@ -132,8 +132,8 @@ mod test {
     #[test]
     fn parse_non_error() -> Result<()> {
         let raw = r#"{"type":"none","msg_id":1}"#;
-        let msg: MessageBody = serde_json::from_str(&raw)?;
-        assert_eq!(msg.is_error(), false);
+        let msg: MessageBody = serde_json::from_str(raw)?;
+        assert!(!msg.is_error());
 
         let err = Error::from(&msg);
         assert_eq!(err.code(), -1);
@@ -144,11 +144,11 @@ mod test {
     #[test]
     fn parse_not_supported_error() -> Result<()> {
         let raw = r#"{"type":"error","msg_id":1, "code": 10}"#;
-        let msg: MessageBody = serde_json::from_str(&raw)?;
-        assert_eq!(msg.is_error(), true);
+        let msg: MessageBody = serde_json::from_str(raw)?;
+        assert!(msg.is_error());
 
         let err = Error::from(&msg);
-        let expected = Error::NotSupported("".to_string());
+        let expected = Error::NotSupported(String::new());
         assert_eq!(err, expected);
 
         Ok(())
