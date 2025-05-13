@@ -1,6 +1,10 @@
 # maelstrom-broadcast-node
 
-This is a minimal fork of maelstrom-node reduced to just the broadcast implementation, and some focus to improve clarity & readability.
+This is a fork of maelstrom-node stripped down to include only the broadcast implementation, along with the following traits:
+
+- Better error handling, instead of Box<dyn E> - we now have concrete errors
+- Simpler Tokio Executor instead of Waitgroup
+- Refactoring & naming to reflect simplicity.
 
 # What is Maelstrom?
 
@@ -14,10 +18,6 @@ violated. With maelstrom you build nodes that form distributed system that can p
 - simple API - single trait fn to implement
 - response types auto-deduction, extra data available via Value()
 - unknown message types handling
-- a/sync RPC() support + timeout / context
-- lin/seq/lww kv storage
-- transparent error handling
-- TODO: thiserror + error parsing/ser causes
 
 # Example
 
