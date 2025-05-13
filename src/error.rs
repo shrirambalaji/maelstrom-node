@@ -1,53 +1,54 @@
 use crate::protocol::{ErrorMessageBody, MessageBody};
-use std::fmt::{Display, Formatter};
+use std::io;
+use thiserror::Error as ThisError;
 
 /// [source](https://github.com/jepsen-io/maelstrom/blob/main/doc/protocol.md#errors).
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, ThisError)]
 pub enum Error {
-    /// Indicates that the requested operation could not be completed within a timeout.
+    #[error("timeout")]
     Timeout,
-    /// Use this error to indicate that a requested operation is not supported by
-    /// the current implementation. Helpful for stubbing out APIs during development.
+
+    #[error("not supported: {0}")]
     NotSupported(String),
-    /// Indicates that the operation definitely cannot be performed at this time--perhaps
-    /// because the server is in a read-only state, has not yet been initialized,
-    /// believes its peers to be down, and so on. Do not use this error for indeterminate
-    /// cases, when the operation may actually have taken place.
+
+    #[error("temporarily unavailable")]
     TemporarilyUnavailable,
-    /// The client's request did not conform to the server's expectations,
-    /// and could not possibly have been processed.
+
+    #[error("malformed request")]
     MalformedRequest,
-    /// Indicates that some kind of general, indefinite error occurred.
-    /// Use this as a catch-all for errors you can't otherwise categorize,
-    /// or as a starting point for your error handler: it's safe to return
-    /// internal-error for every problem by default, then add special cases
-    /// for more specific errors later.
+
+    #[error("crash")]
     Crash,
-    /// Indicates that some kind of general, definite error occurred.
-    /// Use this as a catch-all for errors you can't otherwise categorize,
-    /// when you specifically know that the requested operation has not taken place.
-    /// For instance, you might encounter an indefinite failure during
-    /// the prepare phase of a transaction: since you haven't started the commit process yet,
-    /// the transaction can't have taken place. It's therefore safe to return
-    /// a definite abort to the client.
+
+    #[error("abort")]
     Abort,
-    /// The client requested an operation on a key which does not exist
-    /// (assuming the operation should not automatically create missing keys).
+
+    #[error("key does not exist")]
     KeyDoesNotExist,
-    /// The client requested the creation of a key which already exists,
-    /// and the server will not overwrite it.
+
+    #[error("key already exists")]
     KeyAlreadyExists,
-    /// The requested operation expected some conditions to hold,
-    /// and those conditions were not met. For instance, a compare-and-set operation
-    /// might assert that the value of a key is currently 5; if the value is 3,
-    /// the server would return precondition-failed.
+
+    #[error("precondition failed")]
     PreconditionFailed,
-    /// The requested transaction has been aborted because of a conflict with
-    /// another transaction. Servers need not return this error on every conflict:
-    /// they may choose to retry automatically instead.
+
+    #[error("txn conflict")]
     TxnConflict,
-    /// Custom error code for anything you would like to add.
+
+    #[error("{1}")]
     Custom(i32, String),
+
+    #[error("io error")]
+    Io(#[from] io::Error),
+
+    #[error("json error")]
+    Json(#[from] serde_json::Error),
+
+    #[error("invalid message body")]
+    InvalidMessageBody,
+
+    #[error("cluster already initialized")]
+    ClusterAlreadyInitialized,
 }
 
 impl Error {
@@ -63,7 +64,11 @@ impl Error {
             Error::KeyAlreadyExists => 21,
             Error::PreconditionFailed => 22,
             Error::TxnConflict => 30,
+            Error::Io(_) => -1,
+            Error::Json(_) => -1,
             Error::Custom(code, _) => *code,
+            Error::InvalidMessageBody => -32,
+            Error::ClusterAlreadyInitialized => -33,
         }
     }
 
@@ -80,6 +85,10 @@ impl Error {
             Error::PreconditionFailed => "precondition failed",
             Error::TxnConflict => "txn conflict",
             Error::Custom(_, text) => text.as_str(),
+            Error::Io(_) => "io error",
+            Error::Json(_) => "json error",
+            Error::InvalidMessageBody => "invalid message body",
+            Error::ClusterAlreadyInitialized => "cluster already initialized",
         }
     }
 }
@@ -115,13 +124,13 @@ impl From<ErrorMessageBody> for Error {
     }
 }
 
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "error({}): {}", self.code(), self.description())
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        self.code() == other.code() && self.description() == other.description()
     }
 }
 
-impl std::error::Error for Error {}
+impl Eq for Error {}
 
 #[cfg(test)]
 mod test {

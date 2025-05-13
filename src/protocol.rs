@@ -4,7 +4,6 @@ use crate::{Error, Result};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use simple_error::bail;
 
 /// Message represents a message sent from Src node to Dest node.
 /// The body is stored as parsed `MessageBody` along with the original string
@@ -21,7 +20,7 @@ pub struct Message {
 pub struct MessageBody {
     /// Message type.
     #[serde(rename = "type", default, skip_serializing_if = "String::is_empty")]
-    pub typ: String,
+    pub body_type: String,
 
     /// Optional. Message identifier that is unique to the source node.
     #[serde(default, skip_serializing_if = "u64_zero_by_ref")]
@@ -65,57 +64,51 @@ pub struct ErrorMessageBody {
 }
 
 impl Message {
-    pub fn get_type(&self) -> &str {
-        self.body.typ.as_str()
+    #[must_use] pub fn get_type(&self) -> &str {
+        self.body.body_type.as_str()
     }
 
-    pub fn is_init(&self) -> bool {
-        self.body.typ == "init"
+    #[must_use] pub fn is_init(&self) -> bool {
+        self.body.body_type == "init"
     }
 
-    pub fn is_reply(&self) -> bool {
+    #[must_use] pub fn is_reply(&self) -> bool {
         self.body.in_reply_to != 0
     }
 }
 
 impl MessageBody {
-    #[must_use]
-    pub fn new() -> Self {
+    #[must_use] pub fn new() -> Self {
         Self::default()
     }
 
-    #[must_use]
     pub fn with_type(self, typ: impl Into<String>) -> Self {
         let mut t = self;
-        t.typ = typ.into();
+        t.body_type = typ.into();
         t
     }
 
-    #[must_use]
-    pub fn with_reply_to(self, in_reply_to: u64) -> Self {
+    #[must_use] pub fn with_reply_to(self, in_reply_to: u64) -> Self {
         let mut t = self;
         t.in_reply_to = in_reply_to;
         t
     }
 
-    #[must_use]
-    pub fn and_msg_id(self, msg_id: u64) -> Self {
+    #[must_use] pub fn and_msg_id(self, msg_id: u64) -> Self {
         let mut t = self;
         t.msg_id = msg_id;
         t
     }
 
-    #[must_use]
-    pub fn from_extra(extra: Map<String, Value>) -> Self {
+    #[must_use] pub fn from_extra(extra: Map<String, Value>) -> Self {
         MessageBody {
             extra,
             ..Default::default()
         }
     }
 
-    #[must_use]
-    pub fn is_error(&self) -> bool {
-        self.typ == "error"
+    #[must_use] pub fn is_error(&self) -> bool {
+        self.body_type == "error"
     }
 
     /// ```
@@ -129,13 +122,13 @@ impl MessageBody {
     ///     serde_json::from_value::<BroadcastRequest>(m.body.raw())
     /// }
     /// ```
-    #[must_use]
-    pub fn raw(&self) -> Value {
+
+    #[must_use] pub fn raw(&self) -> Value {
         // we could name it to reflect cloning, but ok.
         // we also could re-serialize whole self to Value first, but probably not needed.
         // users usually need at least type to serialize it into the errors.
         let mut raw = self.extra.clone();
-        drop(raw.insert("type".to_string(), Value::String(self.typ.clone())));
+        drop(raw.insert("type".to_string(), Value::String(self.body_type.clone())));
         Value::Object(raw)
     }
 
@@ -157,7 +150,7 @@ impl MessageBody {
     {
         match T::deserialize(self.raw()) {
             Ok(t) => Ok(t),
-            Err(e) => Err(Box::new(e)),
+            Err(e) => Err(Error::Json(e)),
         }
     }
 }
@@ -171,18 +164,17 @@ impl ErrorMessageBody {
         }
     }
 
-    #[must_use]
-    pub fn from_error(err: Error) -> Self {
+    #[must_use] pub fn from_error(err: Error) -> Self {
         Self::from(err)
     }
 }
 
 impl From<Error> for ErrorMessageBody {
-    fn from(value: Error) -> Self {
+    fn from(err: Error) -> Self {
         ErrorMessageBody {
             typ: "error".to_string(),
-            code: value.code(),
-            text: match value {
+            code: err.code(),
+            text: match err {
                 Error::NotSupported(t) => format!("{t} message type is not supported"),
                 Error::Custom(id, t) => format!("error({id}): {t}"),
                 o => o.description().to_string(),
@@ -191,16 +183,18 @@ impl From<Error> for ErrorMessageBody {
     }
 }
 
-pub fn message<T>(from: impl Into<String>, to: impl Into<String>, message: T) -> Result<Message>
-where
-    T: Serialize,
-{
-    let body = match serde_json::to_value(message) {
-        Ok(v) => match v {
-            Value::Object(m) => m,
-            _ => bail!("response object has invalid serde_json::Value kind"),
-        },
-        Err(e) => bail!("response object is invalid, can't convert: {}", e),
+pub fn build_message(
+    from: impl Into<String>,
+    to: impl Into<String>,
+    message: impl Serialize,
+) -> Result<Message> {
+    // parse the incoming message as json
+    let json = serde_json::to_value(message).map_err(Error::Json)?;
+    let body = match json {
+        Value::Object(m) => m,
+        _ => {
+            return Err(Error::InvalidMessageBody);
+        }
     };
 
     let msg = Message {
