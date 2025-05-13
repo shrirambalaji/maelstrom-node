@@ -6,7 +6,6 @@
 
 pub(crate) mod error;
 pub(crate) mod executor;
-pub mod input;
 pub mod log;
 pub mod protocol;
 pub(crate) mod rpc;
