@@ -24,6 +24,27 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 pub struct Runtime(Arc<RuntimeInner>);
 
+pub struct RuntimeInner {
+    state: Arc<State>,
+    executor: RuntimeExecutor,
+}
+struct State {
+    /// an atomically incrementing message identifier
+    msg_id: MessageId,
+
+    /// a collection of nodes
+    cluster: OnceCell<Cluster>,
+
+    /// the current node
+    node: OnceCell<Arc<dyn Node>>,
+
+    /// a collection of pending replies
+    pending_replies: InflightReplies,
+
+    /// a mutex for stdout
+    stdout: Mutex<Stdout>,
+}
+
 pub struct MessageId(AtomicU64);
 
 impl Default for MessageId {
@@ -47,9 +68,11 @@ impl MessageId {
     }
 }
 
-pub struct RuntimeInner {
-    state: Arc<State>,
-    executor: RuntimeExecutor,
+#[async_trait]
+/// this is the trait that all nodes must implement
+/// our GossipNode implements this trait
+pub trait Node: Sync + Send {
+    async fn process(&self, runtime: Runtime, request: Message) -> Result<()>;
 }
 
 /// Represents the inflight RPC calls that are waiting for a reply.
@@ -79,28 +102,6 @@ impl InflightReplies {
     pub async fn remove(&self, id: u64) -> Option<oneshot::Sender<Message>> {
         self.0.lock().await.remove(&id)
     }
-}
-
-struct State {
-    /// an atomically incrementing message identifier
-    msg_id: MessageId,
-
-    /// a collection of nodes
-    cluster: OnceCell<Cluster>,
-
-    /// the current node
-    node: OnceCell<Arc<dyn Node>>,
-
-    /// a collection of pending replies
-    pending_replies: InflightReplies,
-
-    /// a mutex for stdout
-    stdout: Mutex<Stdout>,
-}
-
-#[async_trait]
-pub trait Node: Sync + Send {
-    async fn process(&self, runtime: Runtime, request: Message) -> Result<()>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
@@ -147,20 +148,20 @@ impl Runtime {
         Ok(())
     }
 
-    /// `send_message()` sends a message to another node through stdout.
-    pub async fn send_message(&self, msg: Message) -> Result<()> {
+    /// `write()` writes a message to stdout.
+    pub async fn write(&self, msg: Message) -> Result<()> {
         self.stdout(serde_json::to_string(&msg)?.as_str()).await
     }
 
-    /// `send()` sends a message to another node.
+    /// `send()` sends a message to another node as a fire-and-forget request, by writing to stdout
     pub async fn send(&self, to: impl Into<String>, message: impl Serialize) -> Result<()> {
         let from = self.node_id();
         let msg = crate::protocol::build_message(from, to, message)?;
-        self.send_message(msg).await
+        self.write(msg).await
     }
 
-    /// `reply()` sends a reply to a message.
-    /// It sets the `in_reply_to` field of the message to the original sender's ID.
+    /// `reply()` sends a response to a message.
+    /// and set the `in_reply_to` field of the message to the original sender's ID.
     pub async fn reply(&self, req: Message, resp: impl Serialize) -> Result<()> {
         let mut msg = crate::protocol::build_message(self.node_id(), req.src, resp)?;
         msg.body.in_reply_to = req.body.msg_id;
@@ -171,7 +172,7 @@ impl Runtime {
             msg.body.extra.insert(key, value);
         }
 
-        self.send_message(msg).await
+        self.write(msg).await
     }
 
     // `reply_ok()` sends a reply with an empty body.
@@ -180,8 +181,7 @@ impl Runtime {
         self.reply(req, response).await
     }
 
-    /// `rpc()` makes a remote call to another node via message passing interface.
-    /// `RpcResult` is immediately canceled on drop.
+    /// `rpc()` makes a call to another node and waits for it to reply back as an `RpcResult`.
     pub fn rpc(
         &self,
         to: impl Into<String>,
@@ -203,7 +203,7 @@ impl Runtime {
         crate::rpc(self.clone(), msg_id, rpc_response)
     }
 
-    /// `execute_rpc()` executes a rpc call in a separate task.
+    /// `execute_rpc()` wraps the `rpc()` method and spawns it on the executor.
     pub fn execute_rpc(&self, to: impl Into<String>, request: impl Serialize + 'static) {
         self.executor.spawn(self.rpc(to.into(), request));
     }
@@ -252,6 +252,7 @@ impl Runtime {
         }
     }
 
+    /// `run()` starts the runtime and listens for messages from stdin, iterating over every line, spawning a new task and processing it as a message.
     pub async fn run(&self) -> Result<()> {
         let mut lines = BufReader::new(stdin()).lines();
         let (error_tx, mut error_rx) = mpsc::channel(1);
@@ -277,6 +278,10 @@ impl Runtime {
         self.on_error(&mut error_rx).await
     }
 
+    /// `process_input()` parses each line as a Maelstrom message, checks if it's a reply or an init message, and processes it accordingly.
+    /// * If it's a reply, it finds the sender of the message from the pending replies and sends it.
+    /// * If it's an init message, it processes the init message and sends a response.
+    /// * If it's a regular message, it checks if there's a node handler set and calls the node's process method.
     async fn process_input(&self, line: String) -> Result<()> {
         let msg = match serde_json::from_str::<Message>(&line) {
             Ok(v) => v,

@@ -11,7 +11,8 @@ pub struct RpcResult {
 }
 
 impl RpcResult {
-    #[must_use] pub fn new(msg_id: u64, rx: Receiver<Message>, runtime: Runtime) -> RpcResult {
+    #[must_use]
+    pub fn new(msg_id: u64, rx: Receiver<Message>, runtime: Runtime) -> RpcResult {
         RpcResult {
             runtime,
             rx: OnceCell::new_with(Some(rx)),
